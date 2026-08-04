@@ -1,0 +1,836 @@
+
+import React, { useState, useCallback, useRef, useEffect } from 'react';
+import { editImage } from '../src/lib/services/geminiService';
+import { ImageFile } from '../types';
+import { DownloadIcon, MeeBotDefaultIcon, SpinnerIcon, UploadIcon, WandIcon } from './Icons';
+import { mintMeeBot } from '../src/lib/services/web3Service';
+import { ethers } from 'ethers';
+
+
+interface ImageEditorProps {
+  provider: ethers.BrowserProvider | null;
+  connectedAccount: string | null;
+  onConnectWallet: () => void;
+  onMintSuccess: () => void;
+}
+
+const Lightbox: React.FC<{ imageUrl: string; onClose: () => void }> = ({ imageUrl, onClose }) => (
+  <div 
+    className="fixed inset-0 bg-black/80 backdrop-blur-sm flex items-center justify-center z-50 animate-[meebot-fadeIn_200ms_ease-out_both]"
+    onClick={onClose}
+    role="dialog"
+    aria-modal="true"
+  >
+    <button 
+      onClick={onClose} 
+      className="absolute top-4 right-4 text-white text-4xl hover:text-slate-300 transition-colors z-10"
+      aria-label="Close image viewer"
+    >
+      &times;
+    </button>
+    <div className="relative p-4 md:p-8" onClick={(e) => e.stopPropagation()}>
+      <img 
+        src={imageUrl} 
+        alt="Enlarged view" 
+        className="max-w-[90vw] max-h-[90vh] rounded-lg shadow-2xl"
+      />
+    </div>
+  </div>
+);
+
+const fileToImageFile = (file: File): Promise<ImageFile> => {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = (event) => {
+      const base64 = (event.target?.result as string)?.split(',')[1];
+      if (base64) {
+        resolve({ base64, mimeType: file.type, name: file.name });
+      } else {
+        reject(new Error("Failed to read file as base64."));
+      }
+    };
+    reader.onerror = (error) => reject(error);
+    reader.readAsDataURL(file);
+  });
+};
+
+const ImageEditor: React.FC<ImageEditorProps> = ({ provider, connectedAccount, onConnectWallet, onMintSuccess }) => {
+  const [originalImage, setOriginalImage] = useState<ImageFile | null>(null);
+  const [editedImage, setEditedImage] = useState<string | null>(null);
+  const [previewImage, setPreviewImage] = useState<string | null>(null);
+  const [prompt, setPrompt] = useState<string>('');
+  const [quality, setQuality] = useState<'1K' | '2K' | '4K'>('1K');
+  const [isLoading, setIsLoading] = useState<boolean>(false);
+  const [isPreviewLoading, setIsPreviewLoading] = useState<boolean>(false);
+  const [error, setError] = useState<string | null>(null);
+  const [notification, setNotification] = useState<string | null>(null);
+  const [galleryImages, setGalleryImages] = useState<string[]>([]);
+  const [lightboxImage, setLightboxImage] = useState<{base64: string, mimeType: string} | null>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
+  const [selectedBackground, setSelectedBackground] = useState<string | null>(null);
+
+  // Minting state
+  const [isMinting, setIsMinting] = useState(false);
+  const [mintSuccessTx, setMintSuccessTx] = useState<string | null>(null);
+  const [mintError, setMintError] = useState<string | null>(null);
+  
+  const [viewMode, setViewMode] = useState<'panels' | 'slider' | 'toggle'>('panels');
+  const [sliderPosition, setSliderPosition] = useState<number>(50);
+  const [showOriginalInToggle, setShowOriginalInToggle] = useState<boolean>(false);
+  
+  const displayImage = editedImage || previewImage;
+
+  // Debounced effect for live preview
+  useEffect(() => {
+    let isActive = true;
+
+    // Use shorter prompt check for preview to be responsive
+    if (!originalImage || !prompt.trim() || prompt.length < 3 || isLoading) {
+      setPreviewImage(null);
+      setIsPreviewLoading(false);
+      return;
+    }
+
+    setIsPreviewLoading(true);
+
+    const handler = setTimeout(async () => {
+      try {
+        if (!isActive) return;
+        // Always use 1K for live preview to maintain responsiveness
+        const resultBase64 = await editImage(originalImage, prompt, '1K');
+        
+        if (isActive) {
+          setPreviewImage(resultBase64);
+        }
+      } catch (err) {
+        console.error("Preview generation failed:", err);
+      } finally {
+        if (isActive) {
+          setIsPreviewLoading(false);
+        }
+      }
+    }, 500);
+
+    return () => {
+      isActive = false;
+      clearTimeout(handler);
+    };
+  }, [prompt, originalImage, isLoading]);
+
+  useEffect(() => {
+    try {
+      const storedGallery = localStorage.getItem('editedImageGallery');
+      if (storedGallery) {
+        const parsed = JSON.parse(storedGallery);
+        if (Array.isArray(parsed)) {
+          setGalleryImages(parsed);
+        }
+      }
+    } catch (e) {
+      console.error("Failed to load gallery from localStorage", e);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (galleryImages.length > 0) {
+      try {
+        localStorage.setItem('editedImageGallery', JSON.stringify(galleryImages));
+      } catch (e) {
+        console.error("Failed to save gallery to localStorage", e);
+      }
+    }
+  }, [galleryImages]);
+
+  useEffect(() => {
+    setMintError(null);
+    setMintSuccessTx(null);
+    setIsMinting(false);
+  }, [editedImage, originalImage]);
+
+
+  const handleFileChange = async (event: React.ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0];
+    if (file) {
+      try {
+        const imageFile = await fileToImageFile(file);
+        setOriginalImage(imageFile);
+        setEditedImage(null);
+        setPreviewImage(null);
+        setError(null);
+        setNotification(null);
+        setViewMode('panels');
+        setSliderPosition(50);
+        setShowOriginalInToggle(false);
+      } catch (err) {
+        setError("Could not process the selected file. Please try another image.");
+      }
+    }
+  };
+
+  const handleSubmit = useCallback(async () => {
+    if (!originalImage || !prompt) {
+      setError("Please upload an image and provide an editing prompt.");
+      return;
+    }
+
+    setIsLoading(true);
+    setError(null);
+    setEditedImage(null);
+    setPreviewImage(null);
+    setNotification(null);
+    setMintError(null);
+    setMintSuccessTx(null);
+
+    try {
+      // Respect user's quality choice for final image
+      const resultBase64 = await editImage(originalImage, prompt, quality);
+      setEditedImage(resultBase64);
+      setGalleryImages(prevGallery => {
+        const base = Array.isArray(prevGallery) ? prevGallery : [];
+        return [resultBase64, ...base.slice(0, 19)];
+      });
+      setNotification(`Final render completed in ${quality} quality.`);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "An unexpected error occurred.");
+    } finally {
+      setIsLoading(false);
+    }
+  }, [originalImage, prompt, quality]);
+
+  const handleMint = async () => {
+    if (!connectedAccount) {
+      onConnectWallet();
+      return;
+    }
+    if (!editedImage) {
+        setMintError("There is no edited image to mint.");
+        return;
+    }
+    if (!provider) {
+        setMintError("Wallet provider is not available.");
+        return;
+    }
+
+    if (!window.confirm('Are you sure you want to mint this image as an NFT?')) {
+        return;
+    }
+
+    setIsMinting(true);
+    setMintError(null);
+    setMintSuccessTx(null);
+
+    try {
+        const txHash = await mintMeeBot(provider);
+        setMintSuccessTx(txHash);
+        onMintSuccess();
+        setNotification("NFT minted successfully!");
+    } catch (err) {
+        setMintError(err instanceof Error ? err.message : "An unexpected minting error occurred.");
+    } finally {
+        setIsMinting(false);
+    }
+  };
+
+  const handleGallerySelect = (base64Image: string) => {
+    const imageFile: ImageFile = {
+        base64: base64Image,
+        mimeType: 'image/png',
+        name: `gallery-image-${Date.now()}.png`
+    };
+    setOriginalImage(imageFile);
+    setEditedImage(null);
+    setPreviewImage(null);
+    setError(null);
+    setViewMode('panels');
+    setSliderPosition(50);
+    setShowOriginalInToggle(false);
+    setNotification('Loaded image from gallery for editing.');
+    window.scrollTo({ top: 0, behavior: 'smooth' });
+  };
+
+  const handleApplyFilter = (filterName: string, filterInstruction: string) => {
+    // If prompt already starts with a filter instruction, we might want to replace it or append
+    // For simplicity, we just set the prompt to have the filter prefix
+    const basePrompt = prompt.replace(/^(Apply a \w+ filter, |Make it \w+, )/i, '');
+    setPrompt(`${filterInstruction}, ${basePrompt || 'enhance the details'}`);
+  };
+
+  const handleReset = () => {
+    setOriginalImage(null);
+    setEditedImage(null);
+    setPreviewImage(null);
+    setPrompt('');
+    setQuality('1K');
+    setError(null);
+    setNotification(null);
+    setMintError(null);
+    setMintSuccessTx(null);
+    setSelectedBackground(null);
+    setViewMode('panels');
+    setSliderPosition(50);
+    setShowOriginalInToggle(false);
+    if(fileInputRef.current) {
+        fileInputRef.current.value = "";
+    }
+  }
+
+  const filters = [
+    { name: 'Vintage', instruction: 'Apply a vintage, retro film look' },
+    { name: 'Grayscale', instruction: 'Make it black and white with high contrast' },
+    { name: 'Sepia', instruction: 'Add a warm sepia tone' },
+    { name: 'Cyberpunk', instruction: 'Add neon lights and a cyberpunk aesthetic' },
+    { name: 'Cinematic', instruction: 'Apply cinematic lighting and color grading' }
+  ];
+
+  const backgroundSuggestions = ['Beach', 'Forest', 'Cityscape', 'Space', 'Abstract Colors'];
+
+  return (
+    <div className="bg-slate-800/50 rounded-lg p-4 md:p-6 space-y-6 border border-slate-700">
+        {/* Comparison Mode Selector */}
+        {originalImage && displayImage && !isLoading && (
+          <div className="flex justify-center mb-2">
+            <div className="inline-flex rounded-lg p-1 bg-slate-900 border border-slate-700 shadow-inner">
+              <button
+                onClick={() => setViewMode('panels')}
+                className={`px-4 py-2 text-xs font-bold rounded-md transition-all ${
+                  viewMode === 'panels' 
+                    ? 'bg-sky-600 text-white shadow-md' 
+                    : 'text-slate-400 hover:text-slate-200'
+                }`}
+              >
+                Split Panels
+              </button>
+              <button
+                onClick={() => setViewMode('slider')}
+                className={`px-4 py-2 text-xs font-bold rounded-md transition-all ${
+                  viewMode === 'slider' 
+                    ? 'bg-sky-600 text-white shadow-md' 
+                    : 'text-slate-400 hover:text-slate-200'
+                }`}
+              >
+                Before/After Slider
+              </button>
+              <button
+                onClick={() => setViewMode('toggle')}
+                className={`px-4 py-2 text-xs font-bold rounded-md transition-all ${
+                  viewMode === 'toggle' 
+                    ? 'bg-sky-600 text-white shadow-md' 
+                    : 'text-slate-400 hover:text-slate-200'
+                }`}
+              >
+                Quick Toggle
+              </button>
+            </div>
+          </div>
+        )}
+
+        <div className="grid md:grid-cols-2 gap-6 items-start">
+            {/* Left Column / Image Comparison Side */}
+            {viewMode === 'panels' ? (
+              <div className="flex flex-col items-center justify-center bg-slate-900/50 p-4 rounded-lg border-2 border-dashed border-slate-700 min-h-[300px]">
+              {originalImage ? (
+                  <div className="relative group w-full">
+                      <img 
+                          src={`data:${originalImage.mimeType};base64,${originalImage.base64}`} 
+                          alt="Original" 
+                          className="rounded-md max-w-full max-h-80 mx-auto cursor-pointer transition-transform hover:scale-105" 
+                          onClick={() => setLightboxImage({ base64: originalImage.base64, mimeType: originalImage.mimeType })}
+                      />
+                      <button onClick={() => fileInputRef.current?.click()} className="absolute top-2 right-2 bg-slate-800/80 text-white p-2 rounded-full opacity-0 group-hover:opacity-100 transition-opacity text-xs">
+                          Change
+                      </button>
+                  </div>
+              ) : (
+                  <div className="text-center">
+                      <UploadIcon className="w-12 h-12 mx-auto text-slate-500 mb-2" />
+                      <p className="text-slate-400 mb-2">Upload an image to start editing</p>
+                      <button onClick={() => fileInputRef.current?.click()} className="bg-sky-600 text-white px-4 py-2 rounded-md font-semibold hover:bg-sky-500 transition-colors">
+                          Select Image
+                      </button>
+                  </div>
+              )}
+              <input type="file" accept="image/*" ref={fileInputRef} onChange={handleFileChange} className="hidden" />
+              </div>
+            ) : viewMode === 'slider' ? (
+              <div className="flex flex-col items-center justify-center bg-slate-900/50 p-4 rounded-lg border border-slate-700 min-h-[300px] relative">
+                <div className="relative w-full overflow-hidden select-none rounded-md" style={{ maxHeight: '320px' }}>
+                  {/* Invisible helper image to establish correct natural aspect ratio of the container */}
+                  <img 
+                    src={`data:${originalImage!.mimeType};base64,${originalImage!.base64}`} 
+                    alt="Reference" 
+                    className="max-h-80 w-auto object-contain opacity-0 pointer-events-none block mx-auto" 
+                  />
+                  
+                  {/* Before Image (Original) */}
+                  <img 
+                    src={`data:${originalImage!.mimeType};base64,${originalImage!.base64}`} 
+                    alt="Original" 
+                    className="absolute inset-0 w-full h-full object-contain pointer-events-none block mx-auto" 
+                  />
+
+                  {/* After Image (Edited/Preview) */}
+                  <img 
+                    src={`data:image/png;base64,${displayImage}`} 
+                    alt="AI Render" 
+                    className="absolute inset-0 w-full h-full object-contain pointer-events-none block mx-auto" 
+                    style={{ clipPath: `polygon(${sliderPosition}% 0, 100% 0, 100% 100%, ${sliderPosition}% 100%)` }}
+                  />
+
+                  {/* Slider Drag Line */}
+                  <div 
+                    className="absolute top-0 bottom-0 w-[2px] bg-sky-500 pointer-events-none shadow-[0_0_8px_rgba(14,165,233,0.8)]"
+                    style={{ left: `${sliderPosition}%` }}
+                  >
+                    {/* Slider Drag Handle Button */}
+                    <div className="absolute top-1/2 -translate-y-1/2 -translate-x-1/2 w-8 h-8 rounded-full bg-slate-800 border-2 border-sky-500 flex items-center justify-center shadow-lg pointer-events-none">
+                      <svg className="w-4 h-4 text-sky-400" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+                        <polyline points="8 17 3 12 8 7" />
+                        <polyline points="16 17 21 12 16 7" />
+                      </svg>
+                    </div>
+                  </div>
+
+                  {/* Labels */}
+                  <div className="absolute top-2 left-2 bg-slate-900/80 text-slate-300 text-[10px] px-2 py-0.5 rounded-md backdrop-blur-sm pointer-events-none font-bold uppercase tracking-wider">
+                    Original
+                  </div>
+                  <div className="absolute top-2 right-2 bg-sky-900/80 text-white text-[10px] px-2 py-0.5 rounded-md backdrop-blur-sm pointer-events-none font-bold uppercase tracking-wider">
+                    AI Render
+                  </div>
+
+                  {/* Range Input for dragging */}
+                  <input 
+                    type="range" 
+                    min="0" 
+                    max="100" 
+                    value={sliderPosition} 
+                    onChange={(e) => setSliderPosition(Number(e.target.value))}
+                    className="absolute inset-0 opacity-0 w-full h-full cursor-ew-resize z-10" 
+                  />
+                </div>
+                <div className="w-full text-center text-xs text-slate-400 mt-2">
+                  Drag slider to compare Before and After
+                </div>
+              </div>
+            ) : (
+              <div className="flex flex-col items-center justify-center bg-slate-900/50 p-4 rounded-lg border border-slate-700 min-h-[300px] relative">
+                <div className="relative w-full flex items-center justify-center rounded-md overflow-hidden" style={{ minHeight: '240px' }}>
+                  {showOriginalInToggle ? (
+                    <img 
+                      src={`data:${originalImage!.mimeType};base64,${originalImage!.base64}`} 
+                      alt="Original" 
+                      className="rounded-md max-w-full max-h-80 mx-auto transition-transform" 
+                    />
+                  ) : (
+                    <img 
+                      src={`data:image/png;base64,${displayImage}`} 
+                      alt="AI Render" 
+                      className="rounded-md max-w-full max-h-80 mx-auto transition-transform" 
+                    />
+                  )}
+                  
+                  {/* Floating indicator */}
+                  <div className={`absolute top-2 left-2 px-2.5 py-1 rounded-md text-[10px] uppercase tracking-wider font-bold backdrop-blur-sm ${
+                    showOriginalInToggle ? 'bg-amber-600/90 text-white' : 'bg-sky-600/90 text-white'
+                  }`}>
+                    {showOriginalInToggle ? 'Original' : 'AI Render'}
+                  </div>
+                </div>
+
+                {/* Toggle Controls */}
+                <div className="mt-4 flex flex-col sm:flex-row gap-2 w-full max-w-xs justify-center">
+                  <button
+                    onMouseDown={() => setShowOriginalInToggle(true)}
+                    onMouseUp={() => setShowOriginalInToggle(false)}
+                    onMouseLeave={() => setShowOriginalInToggle(false)}
+                    onTouchStart={() => setShowOriginalInToggle(true)}
+                    onTouchEnd={() => setShowOriginalInToggle(false)}
+                    className="flex-grow bg-slate-700 hover:bg-slate-600 text-white text-xs font-bold px-4 py-2.5 rounded-md transition-all select-none active:scale-95 border border-slate-600 shadow-md flex items-center justify-center gap-1.5"
+                  >
+                    <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" />
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M2.458 12C3.732 7.943 7.523 5 12 5c4.478 0 8.268 2.943 9.542 7-1.274 4.057-5.064 7-9.542 7-4.477 0-8.268-2.943-9.542-7z" />
+                    </svg>
+                    Hold to View Original
+                  </button>
+                  <button
+                    onClick={() => setShowOriginalInToggle(prev => !prev)}
+                    className="bg-slate-800 hover:bg-slate-700 text-slate-300 text-xs font-semibold px-3 py-2.5 rounded-md transition-colors border border-slate-700"
+                  >
+                    Click to Switch
+                  </button>
+                </div>
+              </div>
+            )}
+
+            {/* Right Column */}
+            {viewMode === 'panels' ? (
+              <div className="flex flex-col items-center justify-center bg-slate-900/50 p-4 rounded-lg border border-slate-700 min-h-[300px] relative">
+              {isLoading ? (
+                  <div className="text-center space-y-4">
+                      <div className="w-24 h-24 mx-auto meebot-rotate">
+                        <MeeBotDefaultIcon className="w-full h-full" />
+                      </div>
+                      <p className="font-bold text-2xl text-slate-100">MeeBot is working...</p>
+                      <p className="text-slate-400">Rendering in {quality} quality...</p>
+                      <div className="flex items-center justify-center space-x-2 text-slate-500">
+                          <SpinnerIcon className="w-5 h-5 animate-spin" />
+                          <span>Generating final image...</span>
+                      </div>
+                  </div>
+              ) : displayImage ? (
+                  <div className="flex flex-col items-center justify-center gap-2 w-full h-full">
+                      <div className="relative w-full h-full flex items-center justify-center">
+                          <img 
+                              src={`data:image/png;base64,${displayImage}`} 
+                              alt={editedImage ? "Edited" : "Preview"}
+                              className="rounded-md max-w-full max-h-80 mx-auto cursor-pointer transition-transform hover:scale-105" 
+                              onClick={() => setLightboxImage({ base64: displayImage, mimeType: 'image/png' })}
+                          />
+                           {!editedImage && (
+                              <div className="absolute top-1 right-1 bg-slate-900/80 text-sky-400 text-xs px-2 py-0.5 rounded-full backdrop-blur-sm">
+                                  Live Preview (1K)
+                              </div>
+                          )}
+                          {editedImage && (
+                               <div className="absolute top-1 right-1 bg-purple-900/80 text-white text-xs px-2 py-0.5 rounded-full backdrop-blur-sm font-bold">
+                                  Final {quality}
+                              </div>
+                          )}
+                      </div>
+                      {editedImage && (
+                          <div className="w-full mt-auto space-y-2">
+                              <a
+                                  href={`data:image/png;base64,${editedImage}`}
+                                  download={`meebot-${quality}.png`}
+                                  className="w-full bg-green-600 text-white px-6 py-3 rounded-md font-semibold hover:bg-green-500 transition-colors flex items-center justify-center"
+                              >
+                                  <DownloadIcon className="w-5 h-5 mr-2" />
+                                  Save {quality} Image
+                              </a>
+                              <button
+                                  onClick={handleMint}
+                                  disabled={isMinting || !!mintSuccessTx}
+                                  className="w-full bg-violet-600 text-white px-6 py-3 rounded-md font-semibold hover:bg-violet-500 transition-colors disabled:bg-slate-600 disabled:cursor-not-allowed flex items-center justify-center"
+                              >
+                                  {isMinting ? (
+                                      <>
+                                          <SpinnerIcon className="w-5 h-5 mr-2 animate-spin" />
+                                          Processing Mint...
+                                      </>
+                                  ) : mintSuccessTx ? 'Minted Successfully!' : 'Mint as NFT'}
+                              </button>
+                          </div>
+                      )}
+                      <div className="w-full text-xs text-center mt-2">
+                          {mintSuccessTx && (
+                               <div className="text-green-400">
+                                  Success! <a href={`https://sepolia.etherscan.io/tx/${mintSuccessTx}`} target="_blank" rel="noopener noreferrer" className="underline hover:text-green-300">View on Etherscan</a>
+                              </div>
+                          )}
+                          {mintError && (
+                              <div className="text-red-400 break-words">
+                                  Minting Error: {mintError}
+                              </div>
+                          )}
+                      </div>
+                  </div>
+              ) : (
+                  <div className="text-center text-slate-500">
+                       {isPreviewLoading ? (
+                          <>
+                              <SpinnerIcon className="w-12 h-12 mx-auto mb-2 animate-spin" />
+                              <p>Generating live preview...</p>
+                          </>
+                      ) : (
+                          <>
+                              <WandIcon className="w-12 h-12 mx-auto mb-2" />
+                              <p>Your edited image will appear here.</p>
+                               <p className="text-xs mt-1">Updates in real-time as you edit.</p>
+                          </>
+                      )}
+                  </div>
+              )}
+               {isPreviewLoading && displayImage && !isLoading && (
+                  <div className="absolute inset-0 bg-slate-900/60 backdrop-blur-sm flex items-center justify-center rounded-lg">
+                      <div className="text-center text-slate-300">
+                          <SpinnerIcon className="w-8 h-8 mx-auto animate-spin" />
+                          <p className="mt-2 text-sm">Updating preview...</p>
+                      </div>
+                  </div>
+              )}
+              </div>
+            ) : (
+              // Right Column Dashboard for active comparison views
+              <div className="flex flex-col bg-slate-900/50 p-6 rounded-lg border border-slate-700 min-h-[300px] h-full justify-between">
+                <div className="space-y-4">
+                  <div className="flex items-center justify-between border-b border-slate-800 pb-3">
+                    <h3 className="font-bold text-slate-100 flex items-center gap-2">
+                      <div className="w-2 h-2 bg-sky-500 rounded-full"></div>
+                      AI Output Controller
+                    </h3>
+                    {editedImage ? (
+                      <span className="bg-purple-900/80 text-white text-[10px] font-bold px-2 py-0.5 rounded-full backdrop-blur-sm uppercase">
+                        Final {quality}
+                      </span>
+                    ) : (
+                      <span className="bg-slate-800 text-sky-400 text-[10px] font-bold px-2 py-0.5 rounded-full backdrop-blur-sm uppercase">
+                        Live Preview (1K)
+                      </span>
+                    )}
+                  </div>
+
+                  <div className="space-y-2">
+                    <span className="text-[10px] font-bold text-slate-500 uppercase tracking-wider block">Active Prompt</span>
+                    <p className="text-xs text-slate-300 italic bg-slate-950 p-2.5 rounded border border-slate-800/80 font-mono break-words leading-relaxed">
+                      "{prompt || 'No instruction applied'}"
+                    </p>
+                  </div>
+
+                  <div className="bg-slate-950/40 border border-slate-800 p-3 rounded space-y-1.5 text-xs text-slate-400">
+                    <div className="flex justify-between">
+                      <span>Original Filename:</span>
+                      <span className="text-slate-200 font-medium font-mono truncate max-w-[150px]">{originalImage?.name || 'Untitled'}</span>
+                    </div>
+                    <div className="flex justify-between">
+                      <span>Mime Type:</span>
+                      <span className="text-slate-300 font-mono">{originalImage?.mimeType || 'image/png'}</span>
+                    </div>
+                    {editedImage && (
+                      <div className="flex justify-between">
+                        <span>Resolution Class:</span>
+                        <span className="text-purple-400 font-bold">{quality}</span>
+                      </div>
+                    )}
+                  </div>
+                </div>
+
+                <div className="space-y-3 pt-4 border-t border-slate-800">
+                  {editedImage ? (
+                    <div className="space-y-2">
+                      <a
+                        href={`data:image/png;base64,${editedImage}`}
+                        download={`meebot-${quality}.png`}
+                        className="w-full bg-green-600 text-white px-6 py-3 rounded-md font-semibold hover:bg-green-500 transition-colors flex items-center justify-center text-sm shadow-md"
+                      >
+                        <DownloadIcon className="w-4 h-4 mr-2" />
+                        Save {quality} Image
+                      </a>
+                      <button
+                        onClick={handleMint}
+                        disabled={isMinting || !!mintSuccessTx}
+                        className="w-full bg-violet-600 text-white px-6 py-3 rounded-md font-semibold hover:bg-violet-500 transition-colors disabled:bg-slate-600 disabled:cursor-not-allowed flex items-center justify-center text-sm shadow-md"
+                      >
+                        {isMinting ? (
+                          <>
+                            <SpinnerIcon className="w-4 h-4 mr-2 animate-spin" />
+                            Processing Mint...
+                          </>
+                        ) : mintSuccessTx ? 'Minted Successfully!' : 'Mint as NFT'}
+                      </button>
+                    </div>
+                  ) : (
+                    <div className="bg-slate-950 p-4 rounded text-center border border-slate-800">
+                      <p className="text-xs text-slate-400">
+                        {isPreviewLoading ? "Generating real-time live preview..." : "Modify instructions and run 'Generate Final Render' to unlock Download and Minting capabilities."}
+                      </p>
+                      {isPreviewLoading && <SpinnerIcon className="w-5 h-5 mx-auto mt-2 animate-spin text-sky-500" />}
+                    </div>
+                  )}
+
+                  <div className="text-xs text-center">
+                    {mintSuccessTx && (
+                      <div className="text-green-400">
+                        Success! <a href={`https://sepolia.etherscan.io/tx/${mintSuccessTx}`} target="_blank" rel="noopener noreferrer" className="underline hover:text-green-300 font-mono">View on Etherscan</a>
+                      </div>
+                    )}
+                    {mintError && (
+                      <div className="text-red-400 break-words font-mono">
+                        Minting Error: {mintError}
+                      </div>
+                    )}
+                  </div>
+                </div>
+              </div>
+            )}
+      </div>
+      
+      {originalImage && (
+        <div className="space-y-6">
+          {/* Quality Slider */}
+          <div className="bg-slate-900/40 p-4 rounded-lg border border-slate-700/50">
+            <div className="flex justify-between items-center mb-4">
+               <label className="text-sm font-medium text-slate-300">Output Quality</label>
+               <span className="text-xs px-2 py-1 rounded bg-slate-700 text-sky-400 font-mono font-bold">
+                 {quality === '1K' ? 'Standard (Flash)' : quality === '2K' ? 'High (Pro)' : 'Ultra (Pro)'}
+               </span>
+            </div>
+            <input 
+              type="range" 
+              min="0" 
+              max="2" 
+              step="1"
+              value={quality === '1K' ? 0 : quality === '2K' ? 1 : 2}
+              onChange={(e) => {
+                const val = parseInt(e.target.value);
+                setQuality(val === 0 ? '1K' : val === 1 ? '2K' : '4K');
+              }}
+              className="w-full h-2 bg-slate-700 rounded-lg appearance-none cursor-pointer accent-sky-500"
+              disabled={isLoading || isMinting}
+            />
+            <div className="flex justify-between mt-2 text-[10px] text-slate-500 font-bold uppercase tracking-wider">
+              <span>1K (Fast)</span>
+              <span>2K (Detailed)</span>
+              <span>4K (Master)</span>
+            </div>
+          </div>
+
+          {/* Filters Presets */}
+          <div>
+            <label className="block text-xs font-medium text-slate-400 mb-2">Filter Presets</label>
+            <div className="flex flex-wrap gap-2">
+                {filters.map((f) => (
+                <button 
+                  key={f.name} 
+                  onClick={() => handleApplyFilter(f.name, f.instruction)} 
+                  disabled={isLoading || isMinting}
+                  className="text-xs bg-slate-700 hover:bg-sky-600 text-slate-200 px-4 py-2 rounded-full transition-all border border-slate-600 hover:border-sky-400"
+                >
+                  {f.name}
+                </button>
+                ))}
+            </div>
+          </div>
+
+          <div>
+            <label htmlFor="prompt" className="block text-sm font-medium text-slate-300 mb-2">Editing Instructions</label>
+            <textarea
+              id="prompt"
+              value={prompt}
+              onChange={(e) => {
+                  setPrompt(e.target.value);
+                  if (selectedBackground) {
+                    setSelectedBackground(null);
+                  }
+              }}
+              placeholder="e.g., 'Add a retro filter' or 'Change background to Mars'"
+              className="w-full bg-slate-900 border border-slate-700 rounded-md p-3 focus:ring-2 focus:ring-sky-500 focus:border-sky-500 transition-shadow text-slate-200 resize-none h-24"
+              rows={3}
+              disabled={isLoading || isMinting}
+            />
+          </div>
+
+          <div className="space-y-3">
+            <div>
+                <label className="block text-xs font-medium text-slate-400 mb-2">Quick Backgrounds</label>
+                <div className="flex flex-wrap gap-2">
+                    {backgroundSuggestions.map((bg) => (
+                    <button 
+                        key={bg} 
+                        onClick={() => {
+                          setSelectedBackground(bg);
+                          setPrompt(`Change the background to a beautiful ${bg.toLowerCase()}`);
+                        }} 
+                        disabled={isLoading || isMinting} 
+                        className={`text-xs px-3 py-1.5 rounded-full transition-all disabled:opacity-50 disabled:cursor-not-allowed ${
+                            selectedBackground === bg 
+                            ? 'bg-sky-500 text-white ring-2 ring-sky-300 ring-offset-2 ring-offset-slate-800' 
+                            : 'bg-slate-700 text-slate-300 hover:bg-slate-600'
+                        }`}
+                    >
+                        {bg}
+                    </button>
+                    ))}
+                </div>
+            </div>
+          </div>
+
+          <div className="flex items-center justify-between gap-4 pt-4 border-t border-slate-700/50">
+            <button
+              onClick={handleSubmit}
+              disabled={isLoading || !prompt || !originalImage || isMinting}
+              className="w-full bg-sky-600 text-white px-6 py-4 rounded-md font-bold hover:bg-sky-500 transition-all disabled:bg-slate-600 disabled:cursor-not-allowed flex items-center justify-center shadow-lg shadow-sky-900/20"
+            >
+              {isLoading ? (
+                <>
+                  <SpinnerIcon className="w-5 h-5 mr-2 animate-spin" />
+                  Rendering Final {quality}...
+                </>
+              ) : (
+                <>
+                  <WandIcon className="w-5 h-5 mr-2" />
+                  Generate Final Render ({quality})
+                </>
+              )}
+            </button>
+             <button
+              onClick={handleReset}
+              disabled={isLoading || isMinting}
+              className="bg-slate-700 text-slate-300 px-6 py-4 rounded-md font-semibold hover:bg-slate-600 transition-colors disabled:opacity-50"
+            >
+              Reset
+            </button>
+          </div>
+        </div>
+      )}
+
+      {error && (
+        <div className="bg-red-900/50 text-red-300 border border-red-800 p-3 rounded-md text-sm">
+          <strong>Error:</strong> {error}
+        </div>
+      )}
+      {notification && !error && (
+        <div className="fixed bottom-6 left-1/2 -translate-x-1/2 bg-slate-700 text-slate-200 px-6 py-3 rounded-full shadow-lg animate-[meebot-fadeIn_420ms_ease-out_both] z-[60]">
+          <div className="flex items-center space-x-2">
+            <div className="w-5 h-5 bg-green-500 rounded-full flex items-center justify-center">
+              <svg xmlns="http://www.w3.org/2000/svg" className="h-3 w-3 text-white" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={3} d="M5 13l4 4L19 7" />
+              </svg>
+            </div>
+            <span>{notification}</span>
+          </div>
+        </div>
+      )}
+
+      <div className="mt-8 pt-6 border-t border-slate-700">
+        <h2 className="text-lg font-semibold text-slate-300 mb-4">Your Recent Edits</h2>
+        {galleryImages.length > 0 ? (
+            <div className="flex gap-4 overflow-x-auto pb-4 -mx-4 px-4">
+                {galleryImages.map((imgBase64, index) => (
+                    <div key={index} className="flex-shrink-0 group relative rounded-md overflow-hidden">
+                        <img
+                            src={`data:image/png;base64,${imgBase64}`}
+                            alt={`Edited image ${index + 1}`}
+                            className="w-32 h-32 object-cover bg-slate-700 cursor-pointer transition-transform group-hover:scale-105"
+                            onClick={() => setLightboxImage({ base64: imgBase64, mimeType: 'image/png' })}
+                        />
+                        <div 
+                            className="absolute inset-0 bg-black/60 flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity cursor-pointer"
+                            onClick={(e) => {
+                                e.stopPropagation();
+                                handleGallerySelect(imgBase64);
+                            }}
+                        >
+                           <span className="text-white text-xs font-bold text-center px-2 pointer-events-none">Edit Again</span>
+                        </div>
+                    </div>
+                ))}
+            </div>
+        ) : (
+            <div className="text-center py-8 bg-slate-900/50 rounded-lg border-2 border-dashed border-slate-700">
+                <p className="text-slate-500">Your edited images will appear here.</p>
+            </div>
+        )}
+      </div>
+
+      {lightboxImage && (
+        <Lightbox 
+            imageUrl={`data:${lightboxImage.mimeType};base64,${lightboxImage.base64}`} 
+            onClose={() => setLightboxImage(null)} 
+        />
+      )}
+    </div>
+  );
+};
+
+export default ImageEditor;

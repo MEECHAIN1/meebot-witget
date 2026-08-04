@@ -1,0 +1,10 @@
+{
+  "name": "Remix: MeeChain AI",
+  "description": "An application that uses the Gemini 2.5 Flash Image model to edit images based on user text prompts. Upload an image, provide an instruction like \u0027add a retro filter\u0027, and generate a new version.",
+  "requestFramePermissions": [
+    "microphone"
+  ],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}

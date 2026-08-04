@@ -1,0 +1,44 @@
+<!DOCTYPE html>
+<html lang="th">
+  <head>
+    <meta charset="UTF-8" />
+    <link rel="icon" type="image/svg+xml" href="/vite.svg" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>MeeChain AI Image Editor</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+      /* For custom scrollbar in webkit browsers */
+      ::-webkit-scrollbar {
+        width: 8px;
+      }
+      ::-webkit-scrollbar-track {
+        background: #1e293b;
+      }
+      ::-webkit-scrollbar-thumb {
+        background: #475569;
+        border-radius: 4px;
+      }
+      ::-webkit-scrollbar-thumb:hover {
+        background: #64748b;
+      }
+    </style>
+<link rel="stylesheet" href="/index.css">
+</head>
+  <body class="bg-gradient-to-br from-slate-900 via-purple-900 to-slate-900">
+    <script>
+      window.global = window;
+      var proc = window.process || {};
+      proc.env = proc.env || { NODE_ENV: 'development' };
+      proc.version = proc.version || 'v18.0.0';
+      proc.versions = proc.versions || { node: '18.0.0' };
+      proc.browser = true;
+      proc.nextTick = proc.nextTick || function(fn) {
+        var args = Array.prototype.slice.call(arguments, 1);
+        setTimeout(function() { fn.apply(null, args); }, 0);
+      };
+      window.process = proc;
+    </script>
+    <div id="root"></div>
+    <script type="module" src="/index.tsx"></script>
+  </body>
+</html>
